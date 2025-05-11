@@ -48,7 +48,7 @@ class HomographyDataset(BaseDataset):
     default_conf = {
         # image search
         "data_dir": "revisitop1m",  # the top-level directory
-        "image_dir": "jpg/",  # the subdirectory with the images
+        "image_dir": "",  # the subdirectory with the images
         "image_list": "revisitop1m.txt",  # optional: list or filename of list
         "glob": ["*.jpg", "*.png", "*.jpeg", "*.JPG", "*.PNG"],
         # splits
@@ -105,13 +105,23 @@ class HomographyDataset(BaseDataset):
             images = sorted(images)  # for deterministic behavior
             logger.info("Found %d images in folder.", len(images))
         elif isinstance(conf.image_list, (str, Path)):
+            
             image_list = data_dir / conf.image_list
             if not image_list.exists():
                 raise FileNotFoundError(f"Cannot find image list {image_list}.")
             images = image_list.read_text().rstrip("\n").split("\n")
-            for image in images:
-                if not (image_dir / image).exists():
-                    raise FileNotFoundError(image_dir / image)
+            if 0:
+                check_proc = tqdm(
+                    range(len(images)), desc="Checking images", position=0, leave=True)
+                for image in images:
+                    image_path = image_dir / image
+                    if not (image_dir / image).exists():
+                        # raise FileNotFoundError(image_dir / image)
+                        #remove the image from the list
+                        images.remove(image)
+                        logger.warning("Image %s could not be read.", image)
+                    check_proc.update(1)
+                check_proc.close()
             logger.info("Found %d images in list file.", len(images))
         elif isinstance(conf.image_list, omegaconf.listconfig.ListConfig):
             images = conf.image_list.to_container()
