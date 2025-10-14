@@ -12,6 +12,7 @@ import torch
 from tqdm import tqdm
 
 from .tensor import batch_to_device
+from .tools import get_device
 
 
 @torch.no_grad()
@@ -27,7 +28,7 @@ def export_predictions(
     assert keys == "*" or isinstance(keys, (tuple, list))
     Path(output_file).parent.mkdir(exist_ok=True, parents=True)
     hfile = h5py.File(str(output_file), "w")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_device()
     model = model.to(device).eval()
     for data_ in tqdm(loader):
         data = batch_to_device(data_, device, non_blocking=True)

@@ -225,6 +225,49 @@ def set_num_threads(nt):
         os.environ[o] = str(nt)
 
 
+def get_device():
+    """Get the best available device for PyTorch operations.
+    
+    Priority: MPS (Apple Silicon) > CUDA > CPU
+    
+    Note: MPS has some limitations:
+    - Only supports float32, not float64 (automatically converted)
+    - Some operations may not be implemented
+    
+    Returns:
+        str: Device string ('mps', 'cuda', or 'cpu')
+    """
+    # Check for MPS (Metal Performance Shaders) on Apple Silicon
+    # if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    #     return "mps"
+    
+    # Check for CUDA
+    if torch.cuda.is_available():
+        return "cuda"
+    
+    # Fall back to CPU
+    return "cpu"
+
+
+def ensure_mps_compatible(tensor, device):
+    """Ensure tensor is compatible with MPS device.
+    
+    MPS doesn't support float64, so convert to float32 if needed.
+    
+    Args:
+        tensor: PyTorch tensor
+        device: Target device
+        
+    Returns:
+        tensor: MPS-compatible tensor
+    """
+    if (str(device) == "mps" and 
+        isinstance(tensor, torch.Tensor) and 
+        tensor.dtype == torch.float64):
+        return tensor.to(torch.float32)
+    return tensor
+
+
 def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -232,6 +275,7 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+    # Note: MPS doesn't have separate seed management like CUDA
 
 
 def get_random_state(with_cuda):

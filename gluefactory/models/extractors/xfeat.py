@@ -57,21 +57,33 @@ def find_accelerated_features():
         "environment variable or ensure it's installed in a standard location."
     )
 
-# 查找并添加accelerated_features路径
-accelerated_features_path = find_accelerated_features()
-if accelerated_features_path not in sys.path:
-    sys.path.append(accelerated_features_path)
+# Lazy import of accelerated_features - only when XFeat class is actually used
+OriginalXFeat = None
+InterpolateSparse2d = None
+accelerated_features_path = None
 
-# Import XFeat from accelerated_features
-try:
-    from modules.xfeat import XFeat as OriginalXFeat
-    from modules.interpolator import InterpolateSparse2d
-except ImportError:
-    raise ImportError(
-        "Cannot import XFeat from accelerated_features. "
-        "Make sure the accelerated_features repository is available "
-        "at the path: " + accelerated_features_path
-    )
+def _ensure_accelerated_features():
+    """Ensure accelerated_features is available and imported."""
+    global OriginalXFeat, InterpolateSparse2d, accelerated_features_path
+    
+    if OriginalXFeat is not None:
+        return  # Already imported
+    
+    try:
+        # 查找并添加accelerated_features路径
+        accelerated_features_path = find_accelerated_features()
+        if accelerated_features_path not in sys.path:
+            sys.path.append(accelerated_features_path)
+        
+        # Import XFeat from accelerated_features
+        from modules.xfeat import XFeat as OriginalXFeat
+        from modules.interpolator import InterpolateSparse2d
+    except ImportError as e:
+        raise ImportError(
+            "Cannot import XFeat from accelerated_features. "
+            "Make sure the accelerated_features repository is available. "
+            f"Error: {e}"
+        )
 
 
 class XFeat(BaseModel):
@@ -86,6 +98,9 @@ class XFeat(BaseModel):
     required_data_keys = ["image"]
 
     def _init(self, conf):
+        # Ensure accelerated_features is available
+        _ensure_accelerated_features()
+        
         # Initialize XFeat model
         default_weights_path = str(Path(accelerated_features_path) / 'weights' / 'xfeat.pt')
         weights_path = default_weights_path

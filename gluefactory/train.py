@@ -34,6 +34,7 @@ from .utils.tools import (
     PRMetric,
     RecallMetric,
     fork_rng,
+    get_device,
     set_seed,
 )
 
@@ -248,11 +249,11 @@ def training(rank, conf, output_dir, args):
         if "train_batch_size" in data_conf:
             data_conf.train_batch_size = int(data_conf.train_batch_size / args.n_gpus)
         if "num_workers" in data_conf:
-            data_conf.num_workers = int(
+            data_conf.num_workers = min(24, int(
                 (data_conf.num_workers + args.n_gpus - 1) / args.n_gpus
-            )
+            ))
     else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = get_device()
     logger.info(f"Using device {device}")
 
     dataset = get_dataset(data_conf.name)(data_conf)

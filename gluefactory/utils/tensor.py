@@ -29,6 +29,11 @@ def batch_to_numpy(batch):
 
 def batch_to_device(batch, device, non_blocking=True):
     def _func(tensor):
+        # Handle MPS limitation: convert float64 to float32
+        if (str(device) == "mps" and 
+            isinstance(tensor, torch.Tensor) and 
+            tensor.dtype == torch.float64):
+            tensor = tensor.to(torch.float32)
         return tensor.to(device=device, non_blocking=non_blocking)
 
     return map_tensor(batch, _func)

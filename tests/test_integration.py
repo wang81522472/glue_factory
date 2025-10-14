@@ -20,7 +20,7 @@ from gluefactory.models.two_view_pipeline import TwoViewPipeline
 from gluefactory.settings import root
 from gluefactory.utils.image import ImagePreprocessor
 from gluefactory.utils.tensor import map_tensor
-from gluefactory.utils.tools import set_seed
+from gluefactory.utils.tools import get_device, set_seed
 from gluefactory.visualization.viz2d import (
     plot_color_line_matches,
     plot_images,
@@ -80,7 +80,7 @@ class TestIntegration(unittest.TestCase):
             ]
         )
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = get_device()
         gs = TwoViewPipeline(OmegaConf.load(model_path).model).to(device).eval()
 
         cv_img0, cv_img1 = cv2.imread(str(img_path0)), cv2.imread(str(img_path1))

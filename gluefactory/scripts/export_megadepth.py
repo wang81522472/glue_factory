@@ -10,6 +10,7 @@ from ..geometry.depth import sample_depth
 from ..models import get_model
 from ..settings import DATA_PATH
 from ..utils.export_predictions import export_predictions
+from ..utils.tools import get_device
 
 resize = 1024
 n_kpts = 2048
@@ -128,7 +129,7 @@ def run_export(feature_file, scene, args):
     dataset = get_dataset(conf.data.name)(conf.data)
     loader = dataset.get_data_loader(conf.split or "test")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_device()
     model = get_model(conf.model.name)(conf.model).eval().to(device)
 
     if args.export_sparse_depth:
