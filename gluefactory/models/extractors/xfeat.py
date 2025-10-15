@@ -75,9 +75,13 @@ def _ensure_accelerated_features():
         if accelerated_features_path not in sys.path:
             sys.path.append(accelerated_features_path)
         
-        # Import XFeat from accelerated_features
-        from modules.xfeat import XFeat as OriginalXFeat
-        from modules.interpolator import InterpolateSparse2d
+        # Import XFeat from accelerated_features (support both package and repo layouts)
+        try:
+            from accelerated_features.modules.xfeat import XFeat as OriginalXFeat  # type: ignore
+            from accelerated_features.modules.interpolator import InterpolateSparse2d  # type: ignore
+        except Exception:
+            from modules.xfeat import XFeat as OriginalXFeat  # type: ignore
+            from modules.interpolator import InterpolateSparse2d  # type: ignore
     except ImportError as e:
         raise ImportError(
             "Cannot import XFeat from accelerated_features. "
