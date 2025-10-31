@@ -22,6 +22,9 @@ from ..geometry.homography import (
     compute_homography,
     sample_homography_corners,
     warp_points,
+    warp_image_fisheye,
+    unwarp_image_fisheye,
+    distort_points_fisheye,
 )
 from ..models.cache_loader import CacheLoader, pad_local_features
 from ..settings import DATA_PATH
@@ -42,6 +45,63 @@ def sample_homography(img, conf: dict, size: list):
     data["coords"] = coords.astype(np.float32)
     data["image_size"] = np.array(size, dtype=np.float32)
     return data
+
+
+# --- Add utility: generate_fisheye_K_D ---
+def generate_fisheye_K_D(
+    img_shape, fisheye_conf, rng=None
+):
+    """
+    Generate (K, D) for fisheye, based on config (random/fixed).
+    img_shape: (height, width) tuple
+    fisheye_conf: config dictionary or OmegaConf
+    rng: numpy RandomState, optional
+    Returns: (K, D) as np.array
+    """
+    import numpy as np
+    if rng is None:
+        rng = np.random
+    Hh, Ww = img_shape
+    if fisheye_conf.random_params:
+        fx = rng.uniform(*fisheye_conf.fx_range)
+        fy = rng.uniform(*fisheye_conf.fy_range)
+        # Default principal point is image center ±10%
+        if fisheye_conf.cx_range is None:
+            cx0 = (Ww - 1) / 2.0
+            cx_delta = 0.1 * Ww
+            cx_range = (cx0 - cx_delta, cx0 + cx_delta)
+        else:
+            cx_range = tuple(fisheye_conf.cx_range)
+        if fisheye_conf.cy_range is None:
+            cy0 = (Hh - 1) / 2.0
+            cy_delta = 0.1 * Hh
+            cy_range = (cy0 - cy_delta, cy0 + cy_delta)
+        else:
+            cy_range = tuple(fisheye_conf.cy_range)
+        cx = rng.uniform(*cx_range)
+        cy = rng.uniform(*cy_range)
+        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+        k1 = rng.uniform(*fisheye_conf.k1_range)
+        k2 = rng.uniform(*fisheye_conf.k2_range)
+        k3 = rng.uniform(*fisheye_conf.k3_range)
+        k4 = rng.uniform(*fisheye_conf.k4_range)
+        D = np.array([k1, k2, k3, k4], dtype=np.float32)
+    else:
+        if fisheye_conf.K is not None:
+            K = np.array(fisheye_conf.K, dtype=np.float32)
+        else:
+            K = np.array(
+                [
+                    [fisheye_conf.fx, 0, fisheye_conf.cx],
+                    [0, fisheye_conf.fy, fisheye_conf.cy],
+                    [0, 0, 1],
+                ], dtype=np.float32
+            )
+        if fisheye_conf.D is not None:
+            D = np.array(fisheye_conf.D, dtype=np.float32)
+        else:
+            D = np.array([0.01, 0.001, 0.0, 0.0], dtype=np.float32)
+    return K, D
 
 
 class HomographyDataset(BaseDataset):
@@ -81,6 +141,26 @@ class HomographyDataset(BaseDataset):
             "thresh": 0.0,
             "max_num_keypoints": -1,
             "force_num_keypoints": False,
+        },
+        # fisheye distortion parameters
+        "fisheye": {
+            "apply_fisheye": False,
+            "random_params": False,  # Use random fisheye parameters for each sample
+            "K": None,  # Camera intrinsic matrix (3, 3) - used if random_params=False
+            "D": None,   # Distortion coefficients [k1, k2, k3, k4] - used if random_params=False
+            "fx": 500.0,  # Focal length x - used if random_params=False
+            "fy": 500.0,  # Focal length y - used if random_params=False
+            "cx": 320.0,  # Principal point x - used if random_params=False
+            "cy": 240.0,  # Principal point y - used if random_params=False
+            # Random parameter ranges (used if random_params=True)
+            "fx_range": [300.0, 800.0],
+            "fy_range": [300.0, 800.0],
+            "cx_range": None,  # None means auto-calculate from image center ± 10%
+            "cy_range": None,  # None means auto-calculate from image center ± 10%
+            "k1_range": [-0.5, 0.5],
+            "k2_range": [-0.1, 0.1],
+            "k3_range": [-0.01, 0.01],
+            "k4_range": [-0.001, 0.001],
         },
     }
 
@@ -163,6 +243,7 @@ class HomographyDataset(BaseDataset):
 
 class _Dataset(torch.utils.data.Dataset):
     def __init__(self, conf, image_names, split):
+        import numpy as np
         self.conf = conf
         self.split = split
         self.image_names = np.array(image_names)
@@ -223,12 +304,17 @@ class _Dataset(torch.utils.data.Dataset):
         else:
             return self.getitem(idx)
 
-    def _read_view(self, img, H_conf, ps, left=False):
+    def _read_view(self, img, H_conf, fisheye_params, ps, left=False):
         data = sample_homography(img, H_conf, ps)
         if left:
             data["image"] = self.left_augment(data["image"], return_tensor=True)
         else:
+            if fisheye_params is not None and fisheye_params.get("apply_fisheye", True):
+                data["fisheye_params"] = {}
+                data["fisheye_params"]["K"], data["fisheye_params"]["D"] = generate_fisheye_K_D(img.shape[:2], fisheye_params)
+                data["image"] = warp_image_fisheye(data["image"], data["fisheye_params"]["K"], data["fisheye_params"]["D"])
             data["image"] = self.photo_augment(data["image"], return_tensor=True)
+            
 
         gs = data["image"].new_tensor([0.299, 0.587, 0.114]).view(3, 1, 1)
         if self.conf.grayscale:
@@ -237,6 +323,9 @@ class _Dataset(torch.utils.data.Dataset):
         if self.conf.load_features.do:
             features = self.feature_loader({k: [v] for k, v in data.items()})
             features = self._transform_keypoints(features, data)
+            if not left:
+                if fisheye_params is not None and fisheye_params.get("apply_fisheye", True):
+                    features["keypoints"] = distort_points_fisheye(features["keypoints"], data["fisheye_params"]["K"], data["fisheye_params"]["D"])
             data["cache"] = features
 
         return data
@@ -255,8 +344,30 @@ class _Dataset(torch.utils.data.Dataset):
         if self.conf.right_only:
             left_conf["difficulty"] = 0.0
 
-        data0 = self._read_view(img, left_conf, ps, left=True)
-        data1 = self._read_view(img, self.conf.homography, ps, left=False)
+        data0 = self._read_view(img, left_conf, None, ps, left=True)
+        data1 = self._read_view(img, self.conf.homography, self.conf.fisheye, ps, left=False)
+
+
+        # img0 = data0["image"].detach().cpu().permute(1, 2, 0).numpy()
+        # img1 = warp_image_fisheye(img0, data1["K"], data1["D"])
+        # img2 = data1["image"].detach().cpu().permute(1, 2, 0).numpy()
+
+        # fig, axs = plt.subplots(1, 3, figsize=(12, 5))
+        # axs[0].imshow(img0)
+        # axs[0].set_title("View0")
+        # axs[0].axis("off")
+        # # scatter(axs[0], kpts0, c='yellow', s=6)
+
+        # axs[1].imshow(img1)
+        # axs[1].set_title("View1")
+        # axs[1].axis("off")
+
+        # axs[2].imshow(img2)
+        # axs[2].set_title("View2")
+        # axs[2].axis("off")
+
+        # plt.tight_layout()
+        # plt.show()
 
         H = compute_homography(data0["coords"], data1["coords"], [1, 1])
 

@@ -11,6 +11,26 @@ data:
         max_angle: 45
     photometric:
         name: lg
+
+    fisheye:
+        apply_fisheye: true
+        random_params: true
+        fx_range: [300.0, 800.0]
+        fy_range: [300.0, 600.0]
+        cx_range: [300.0, 340.0]
+        cy_range: [220.0, 260.0]
+        k1_range: [-0.5, 2.5]
+        k2_range: [-0.1, 0.1]
+        k3_range: [-0.01, 0.01]
+        k4_range: [-0.001, 0.001]
+        fx: 500.0
+        fy: 500.0
+        cx: 320.0
+        cy: 240.0
+        D: [-0.5, 0.0, 0.00, 0.00]
+
+        
+    
 model:
     name: two_view_pipeline
     extractor:

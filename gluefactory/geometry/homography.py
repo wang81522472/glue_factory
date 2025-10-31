@@ -3,6 +3,7 @@ from typing import Tuple
 
 import numpy as np
 import torch
+import cv2
 
 from .utils import from_homogeneous, to_homogeneous
 
@@ -179,9 +180,372 @@ def warp_points_torch(points, H, inverse=True):
     warped_points = from_homogeneous(warped_points, eps=1e-5)
     return warped_points
 
+def distort_points_fisheye(points, K, D):
+    # Self-implemented forward fisheye model (Kannala–Brandt)
+    # Input: points shape (N,1,2) in pixel coords (undistorted pinhole projection)
+    # Output: distorted pixel coords, shape (N,1,2)
+    if isinstance(points, torch.Tensor):
+        pts = points
+        assert pts.ndim == 3 and pts.shape[-2:] == (1, 2), "Expected (N,1,2)"
+        device = pts.device
+        dtype = pts.dtype
+        Kt = torch.as_tensor(K, dtype=dtype, device=device)
+        Dt = torch.as_tensor(D, dtype=dtype, device=device).view(-1)
+        fx, fy = Kt[0, 0], Kt[1, 1]
+        cx, cy = Kt[0, 2], Kt[1, 2]
+        xu = (pts[:, 0, 0] - cx) / fx
+        yu = (pts[:, 0, 1] - cy) / fy
+        ru = torch.sqrt(xu * xu + yu * yu)
+        k1 = Dt[0] if Dt.numel() > 0 else torch.tensor(0.0, dtype=dtype, device=device)
+        k2 = Dt[1] if Dt.numel() > 1 else torch.tensor(0.0, dtype=dtype, device=device)
+        k3 = Dt[2] if Dt.numel() > 2 else torch.tensor(0.0, dtype=dtype, device=device)
+        k4 = Dt[3] if Dt.numel() > 3 else torch.tensor(0.0, dtype=dtype, device=device)
+        theta = torch.atan(ru)
+        t2 = theta * theta
+        t4 = t2 * t2
+        t6 = t4 * t2
+        t8 = t4 * t4
+        theta_d = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8)
+        rd = torch.tan(theta_d)
+        scale = torch.where(ru > 0, rd / ru, torch.zeros_like(ru))
+        xd = xu * scale
+        yd = yu * scale
+        out = torch.empty_like(pts)
+        out[:, 0, 0] = fx * xd + cx
+        out[:, 0, 1] = fy * yd + cy
+        center_mask = ru == 0
+        if center_mask.any():
+            out[center_mask, 0, 0] = cx
+            out[center_mask, 0, 1] = cy
+        return out
+    else:
+        pts = np.asarray(points)
+        assert pts.ndim == 3 and pts.shape[-2:] == (1, 2), "Expected (N,1,2)"
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        xu = (pts[:, 0, 0] - cx) / fx
+        yu = (pts[:, 0, 1] - cy) / fy
+        ru = np.sqrt(xu * xu + yu * yu)
+        d = np.asarray(D).reshape(-1)
+        k1 = d[0] if d.size > 0 else 0.0
+        k2 = d[1] if d.size > 1 else 0.0
+        k3 = d[2] if d.size > 2 else 0.0
+        k4 = d[3] if d.size > 3 else 0.0
+        theta = np.arctan(ru)
+        t2 = theta * theta
+        t4 = t2 * t2
+        t6 = t4 * t2
+        t8 = t4 * t4
+        theta_d = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8)
+        rd = np.tan(theta_d)
+        out = np.empty_like(pts, dtype=pts.dtype)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            scale = np.where(ru > 0, rd / ru, 0.0)
+            xd = xu * scale
+            yd = yu * scale
+        out[:, 0, 0] = fx * xd + cx
+        out[:, 0, 1] = fy * yd + cy
+        center_mask = ru == 0
+        if np.any(center_mask):
+            out[center_mask, 0, 0] = cx
+            out[center_mask, 0, 1] = cy
+        return out
 
+
+def undistort_points_fisheye(points, K, D):
+    # Self-implemented inverse of OpenCV fisheye model (Kannala–Brandt)
+    # Input: points shape (N,1,2) in pixel coords; Output: same shape, pixel coords with P=K
+    if isinstance(points, torch.Tensor):
+        pts = points
+        assert pts.ndim == 3 and pts.shape[-2:] == (1, 2), "Expected (N,1,2)"
+        device = pts.device
+        dtype = pts.dtype
+        Kt = torch.as_tensor(K, dtype=dtype, device=device)
+        Dt = torch.as_tensor(D, dtype=dtype, device=device).view(-1)
+        fx, fy = Kt[0, 0], Kt[1, 1]
+        cx, cy = Kt[0, 2], Kt[1, 2]
+        xd = (pts[:, 0, 0] - cx) / fx
+        yd = (pts[:, 0, 1] - cy) / fy
+        rd = torch.sqrt(xd * xd + yd * yd)
+        out = torch.empty_like(pts)
+        k1 = Dt[0] if Dt.numel() > 0 else torch.tensor(0.0, dtype=dtype, device=device)
+        k2 = Dt[1] if Dt.numel() > 1 else torch.tensor(0.0, dtype=dtype, device=device)
+        k3 = Dt[2] if Dt.numel() > 2 else torch.tensor(0.0, dtype=dtype, device=device)
+        k4 = Dt[3] if Dt.numel() > 3 else torch.tensor(0.0, dtype=dtype, device=device)
+        theta_d = torch.atan(rd)
+        theta = theta_d.clone()
+        for _ in range(8):
+            t2 = theta * theta
+            t4 = t2 * t2
+            t6 = t4 * t2
+            t8 = t4 * t4
+            poly = 1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8
+            f = theta * poly - theta_d
+            dtheta = 1.0 + 3.0 * k1 * t2 + 5.0 * k2 * t4 + 7.0 * k3 * t6 + 9.0 * k4 * t8
+            theta = theta - torch.where(dtheta != 0, f / dtheta, torch.zeros_like(dtheta))
+        ru = torch.tan(theta)
+        scale = torch.where(rd > 0, ru / rd, torch.zeros_like(rd))
+        xu = xd * scale
+        yu = yd * scale
+        out[:, 0, 0] = fx * xu + cx
+        out[:, 0, 1] = fy * yu + cy
+        center_mask = rd == 0
+        if center_mask.any():
+            out[center_mask, 0, 0] = cx
+            out[center_mask, 0, 1] = cy
+        return out
+    else:
+        pts = np.asarray(points)
+        assert pts.ndim == 3 and pts.shape[-2:] == (1, 2), "Expected (N,1,2)"
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        xd = (pts[:, 0, 0] - cx) / fx
+        yd = (pts[:, 0, 1] - cy) / fy
+        rd = np.sqrt(xd * xd + yd * yd)
+        out = np.empty_like(pts, dtype=pts.dtype)
+        d = np.asarray(D).reshape(-1)
+        k1 = d[0] if d.size > 0 else 0.0
+        k2 = d[1] if d.size > 1 else 0.0
+        k3 = d[2] if d.size > 2 else 0.0
+        k4 = d[3] if d.size > 3 else 0.0
+        theta_d = np.arctan(rd)
+        # Use float64 internally for numerical stability during iterations
+        theta = theta_d.astype(np.float64, copy=True)
+        k1_ = np.float64(k1)
+        k2_ = np.float64(k2)
+        k3_ = np.float64(k3)
+        k4_ = np.float64(k4)
+        for _ in range(8):
+            # Guard against overflow in intermediate powers and products
+            with np.errstate(over="ignore", invalid="ignore"): 
+                t2 = theta * theta
+                t4 = t2 * t2
+                t6 = t4 * t2
+                t8 = t4 * t4
+                poly = 1.0 + k1_ * t2 + k2_ * t4 + k3_ * t6 + k4_ * t8
+                f = theta * poly - theta_d
+                dtheta = 1.0 + 3.0 * k1_ * t2 + 5.0 * k2_ * t4 + 7.0 * k3_ * t6 + 9.0 * k4_ * t8
+                denom = np.where(dtheta != 0.0, dtheta, 1.0)
+                step = f / denom
+            # Limit step size to avoid divergence; keep theta away from pi/2 where tan explodes
+            step = np.clip(step, -0.5, 0.5)
+            theta = theta - step
+            theta = np.clip(theta, 0.0, (np.pi / 2.0) - 1e-6)
+        # Back to original dtype for subsequent computations
+        theta = theta.astype(np.float64)
+        theta = np.clip(theta, 0.0, (np.pi / 2.0) - 1e-6)
+        ru = np.tan(theta)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            scale = np.where(rd > 0, ru / rd, 0.0)
+            xu = xd * scale
+            yu = yd * scale
+        out[:, 0, 0] = fx * xu + cx
+        out[:, 0, 1] = fy * yu + cy
+        center_mask = rd == 0
+        if np.any(center_mask):
+            out[center_mask, 0, 0] = cx
+            out[center_mask, 0, 1] = cy
+        return out
+
+
+def warp_image_fisheye(image, K, D):
+    Hh, Ww = image.shape[:2]
+    grid_x, grid_y = np.meshgrid(np.arange(Ww, dtype=np.float32), np.arange(Hh, dtype=np.float32))
+    undist_pts = undistort_points_fisheye(np.stack([grid_x, grid_y], axis=-1).reshape(-1, 1, 2), K, D)
+    # pts = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 1, 2)
+    # # Map distorted pixels to undistorted pixels using P=K to get pixel coords directly
+    # undist_pts = cv2.fisheye.undistortPoints(pts, K, D, P=K)  # (N,1,2)
+    map_x = undist_pts[:, 0, 0].reshape(Hh, Ww).astype(np.float32)
+    map_y = undist_pts[:, 0, 1].reshape(Hh, Ww).astype(np.float32)
+    # Keep coordinates within image to avoid excessive black regions
+    # np.clip(map_x, 0, Ww - 1, out=map_x)
+    # np.clip(map_y, 0, Hh - 1, out=map_y)
+    return cv2.remap(
+        image, map_x, map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+
+def unwarp_image_fisheye(image, K, D):
+    Hh, Ww = image.shape[:2]
+    grid_x, grid_y = np.meshgrid(np.arange(Ww, dtype=np.float32), np.arange(Hh, dtype=np.float32))
+    u = grid_x.reshape(-1)
+    v = grid_y.reshape(-1)
+    # x = (u - K[0, 2]) / K[0, 0]
+    # y = (v - K[1, 2]) / K[1, 1]
+    dist_pts = distort_points_fisheye(np.stack([u, v], axis=-1).reshape(-1, 1, 2), K, D)
+    # pts = np.stack([x, y], axis=-1).reshape(-1, 1, 2)
+    # # Map distorted pixels to undistorted pixels using P=K to get pixel coords directly
+    # dist_pts = cv2.fisheye.distortPoints(pts, K, D)
+    map_x = dist_pts[:, 0, 0].reshape(Hh, Ww).astype(np.float32)
+    map_y = dist_pts[:, 0, 1].reshape(Hh, Ww).astype(np.float32)
+    # Keep coordinates within image to avoid excessive black regions
+    # np.clip(map_x, 0, Ww - 1, out=map_x)
+    # np.clip(map_y, 0, Hh - 1, out=map_y)
+    return cv2.remap(
+        image, map_x, map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+
+def distort_points_fisheye_torch(points, K, D):
+    """
+    Batched forward fisheye distortion (Kannala–Brandt) implemented in PyTorch.
+    - points: (B, N, 2) or (B, N, 1, 2) undistorted pixel coordinates
+    - K: (B, 3, 3) or (3, 3)
+    - D: (B, 4) or (4,)
+    Returns: same shape as input points, distorted pixel coordinates
+    """
+    assert isinstance(points, torch.Tensor), "points must be a torch.Tensor"
+    orig_shape = points.shape
+    assert points.dim() in (3, 4), "points must be (B,N,2) or (B,N,1,2)"
+    if points.dim() == 4:
+        assert points.size(-2) == 1 and points.size(-1) == 2
+        pts = points.squeeze(-2)  # (B,N,2)
+    else:
+        assert points.size(-1) == 2
+        pts = points  # (B,N,2)
+
+    B = pts.size(0)
+    device, dtype = pts.device, pts.dtype
+
+    Kt = torch.as_tensor(K, dtype=dtype, device=device)
+    if Kt.dim() == 2:
+        Kt = Kt.unsqueeze(0).expand(B, -1, -1)
+    assert Kt.shape == (B, 3, 3)
+
+    Dt = torch.as_tensor(D, dtype=dtype, device=device)
+    if Dt.dim() == 1:
+        Dt = Dt.unsqueeze(0).expand(B, -1)
+    assert Dt.shape[0] == B and Dt.size(-1) >= 1
+
+    fx = Kt[:, 0, 0].unsqueeze(1)
+    fy = Kt[:, 1, 1].unsqueeze(1)
+    cx = Kt[:, 0, 2].unsqueeze(1)
+    cy = Kt[:, 1, 2].unsqueeze(1)
+
+    xu = (pts[..., 0] - cx) / fx
+    yu = (pts[..., 1] - cy) / fy
+    ru = torch.sqrt(xu * xu + yu * yu)
+
+    def get_coeff(i):
+        if Dt.size(-1) > i:
+            return Dt[:, i].unsqueeze(1)
+        return torch.zeros((B, 1), dtype=dtype, device=device)
+
+    k1 = get_coeff(0)
+    k2 = get_coeff(1)
+    k3 = get_coeff(2)
+    k4 = get_coeff(3)
+
+    theta = torch.atan(ru)
+    t2 = theta * theta
+    t4 = t2 * t2
+    t6 = t4 * t2
+    t8 = t4 * t4
+    theta_d = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8)
+    rd = torch.tan(theta_d)
+
+    scale = torch.where(ru > 0, rd / ru, torch.zeros_like(ru))
+    xd = xu * scale
+    yd = yu * scale
+
+    xd_pix = fx * xd + cx
+    yd_pix = fy * yd + cy
+
+    out = torch.stack([xd_pix, yd_pix], dim=-1)
+    if len(orig_shape) == 4:
+        out = out.unsqueeze(-2)  # (B,N,1,2)
+    return out
+
+def undistort_points_fisheye_torch(points, K, D):
+    """
+    Batched fisheye undistortion (inverse Kannala–Brandt) in PyTorch using Newton iterations.
+    - points: (B, N, 2) or (B, N, 1, 2) distorted pixel coordinates
+    - K: (B, 3, 3) or (3, 3)
+    - D: (B, 4) or (4,)
+    Returns: same shape as input points, undistorted pixel coordinates
+    """
+    assert isinstance(points, torch.Tensor), "points must be a torch.Tensor"
+    orig_shape = points.shape
+    assert points.dim() in (3, 4), "points must be (B,N,2) or (B,N,1,2)"
+    if points.dim() == 4:
+        assert points.size(-2) == 1 and points.size(-1) == 2
+        pts = points.squeeze(-2)  # (B,N,2)
+    else:
+        assert points.size(-1) == 2
+        pts = points  # (B,N,2)
+
+    B = pts.size(0)
+    device, dtype = pts.device, pts.dtype
+
+    Kt = torch.as_tensor(K, dtype=dtype, device=device)
+    if Kt.dim() == 2:
+        Kt = Kt.unsqueeze(0).expand(B, -1, -1)
+    assert Kt.shape == (B, 3, 3)
+
+    Dt = torch.as_tensor(D, dtype=dtype, device=device)
+    if Dt.dim() == 1:
+        Dt = Dt.unsqueeze(0).expand(B, -1)
+    assert Dt.shape[0] == B and Dt.size(-1) >= 1
+
+    fx = Kt[:, 0, 0].unsqueeze(1)
+    fy = Kt[:, 1, 1].unsqueeze(1)
+    cx = Kt[:, 0, 2].unsqueeze(1)
+    cy = Kt[:, 1, 2].unsqueeze(1)
+
+    xd = (pts[..., 0] - cx) / fx
+    yd = (pts[..., 1] - cy) / fy
+    rd = torch.sqrt(xd * xd + yd * yd)
+
+    def get_coeff(i):
+        if Dt.size(-1) > i:
+            return Dt[:, i].unsqueeze(1)
+        return torch.zeros((B, 1), dtype=dtype, device=device)
+
+    k1 = get_coeff(0)
+    k2 = get_coeff(1)
+    k3 = get_coeff(2)
+    k4 = get_coeff(3)
+
+    # Solve theta * (1 + k1*t^2 + k2*t^4 + k3*t^6 + k4*t^8) = theta_d, where theta_d = atan(rd)
+    theta_d = torch.atan(rd)
+    # Use float64 for numerical stability during iterations
+    theta = theta_d.to(torch.float64)
+    k1d = k1.to(torch.float64)
+    k2d = k2.to(torch.float64)
+    k3d = k3.to(torch.float64)
+    k4d = k4.to(torch.float64)
+    for _ in range(8):
+        t2 = theta * theta
+        t4 = t2 * t2
+        t6 = t4 * t2
+        t8 = t4 * t4
+        poly = 1.0 + k1d * t2 + k2d * t4 + k3d * t6 + k4d * t8
+        f = theta * poly - theta_d.to(torch.float64)
+        dtheta = 1.0 + 3.0 * k1d * t2 + 5.0 * k2d * t4 + 7.0 * k3d * t6 + 9.0 * k4d * t8
+        denom = torch.where(dtheta != 0, dtheta, torch.ones_like(dtheta))
+        step = f / denom
+        # Limit step and keep theta away from pi/2 where tan explodes
+        step = torch.clamp(step, -0.5, 0.5)
+        theta = theta - step
+        theta = torch.clamp(theta, 0.0, (math.pi / 2.0) - 1e-6)
+
+    theta = torch.clamp(theta, 0.0, (math.pi / 2.0) - 1e-6)
+    theta = theta.to(dtype)
+    ru = torch.tan(theta)
+    scale = torch.where(rd > 0, ru / rd, torch.zeros_like(rd))
+    xu = xd * scale
+    yu = yd * scale
+
+    xu_pix = fx * xu + cx
+    yu_pix = fy * yu + cy
+
+    out = torch.stack([xu_pix, yu_pix], dim=-1)
+    if len(orig_shape) == 4:
+        out = out.unsqueeze(-2)  # (B,N,1,2)
+    return out
 # Line warping utils
-
 
 def seg_equation(segs):
     # calculate list of start, end and midpoints points from both lists

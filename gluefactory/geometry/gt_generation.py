@@ -5,6 +5,7 @@ from scipy.optimize import linear_sum_assignment
 from .depth import project, sample_depth
 from .epipolar import T_to_E, sym_epipolar_distance_all
 from .homography import warp_points_torch
+from .homography import undistort_points_fisheye_torch
 
 IGNORE_FEATURE = -2
 UNMATCHED_FEATURE = -1
@@ -107,7 +108,11 @@ def gt_matches_from_pose_depth(
 
 
 @torch.no_grad()
-def gt_matches_from_homography(kp0, kp1, H, pos_th=3, neg_th=6, **kw):
+def gt_matches_from_homography(kp0, kp1, H, pos_th=3, neg_th=6, fisheye_params = None, **kw):
+
+    if fisheye_params is not None:
+        kp1 = undistort_points_fisheye_torch(kp1, fisheye_params["K"], fisheye_params["D"])
+
     if kp0.shape[1] == 0 or kp1.shape[1] == 0:
         b_size, n_kp0 = kp0.shape[:2]
         n_kp1 = kp1.shape[1]
