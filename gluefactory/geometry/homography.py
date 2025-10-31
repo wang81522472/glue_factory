@@ -206,7 +206,8 @@ def distort_points_fisheye(points, K, D):
         t6 = t4 * t2
         t8 = t4 * t4
         theta_d = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8)
-        rd = torch.tan(theta_d)
+        # OpenCV uses rd = theta_d directly (not tan(theta_d)), consistent with undistort
+        rd = theta_d
         scale = torch.where(ru > 0, rd / ru, torch.zeros_like(ru))
         xd = xu * scale
         yd = yu * scale
@@ -237,7 +238,8 @@ def distort_points_fisheye(points, K, D):
         t6 = t4 * t2
         t8 = t4 * t4
         theta_d = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8)
-        rd = np.tan(theta_d)
+        # OpenCV uses rd = theta_d directly (not tan(theta_d)), consistent with undistort
+        rd = theta_d
         out = np.empty_like(pts, dtype=pts.dtype)
         with np.errstate(invalid="ignore", divide="ignore"):
             scale = np.where(ru > 0, rd / ru, 0.0)
@@ -253,6 +255,7 @@ def distort_points_fisheye(points, K, D):
 
 
 def undistort_points_fisheye(points, K, D):
+    # return cv2.fisheye.undistortPoints(points, K, D, P=K)
     # Self-implemented inverse of OpenCV fisheye model (Kannala–Brandt)
     # Input: points shape (N,1,2) in pixel coords; Output: same shape, pixel coords with P=K
     if isinstance(points, torch.Tensor):
@@ -272,9 +275,11 @@ def undistort_points_fisheye(points, K, D):
         k2 = Dt[1] if Dt.numel() > 1 else torch.tensor(0.0, dtype=dtype, device=device)
         k3 = Dt[2] if Dt.numel() > 2 else torch.tensor(0.0, dtype=dtype, device=device)
         k4 = Dt[3] if Dt.numel() > 3 else torch.tensor(0.0, dtype=dtype, device=device)
-        theta_d = torch.atan(rd)
+        # OpenCV uses rd directly as theta_d, not atan(rd)
+        theta_d = rd.clone()
         theta = theta_d.clone()
-        for _ in range(8):
+        prev_theta = theta.clone()
+        for iter_idx in range(20):
             t2 = theta * theta
             t4 = t2 * t2
             t6 = t4 * t2
@@ -282,7 +287,25 @@ def undistort_points_fisheye(points, K, D):
             poly = 1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8
             f = theta * poly - theta_d
             dtheta = 1.0 + 3.0 * k1 * t2 + 5.0 * k2 * t4 + 7.0 * k3 * t6 + 9.0 * k4 * t8
-            theta = theta - torch.where(dtheta != 0, f / dtheta, torch.zeros_like(dtheta))
+            step = torch.where(dtheta != 0, f / dtheta, torch.zeros_like(dtheta))
+            step = torch.clamp(step, -0.5, 0.5)
+            theta_new = theta - step
+            theta_new = torch.clamp(theta_new, 0.0, (math.pi / 2.0) - 1e-6)
+            # Check for convergence
+            error = torch.abs(f)
+            theta_change = torch.abs(theta_new - theta)
+            if (error < 1e-10).all() and (theta_change < 1e-10).all():
+                theta = theta_new
+                break
+            prev_theta = theta
+            theta = theta_new
+        theta = torch.clamp(theta, 0.0, (math.pi / 2.0) - 1e-6)
+        # Check for invalid solutions
+        final_poly = 1.0 + k1 * theta * theta + k2 * theta**4 + k3 * theta**6 + k4 * theta**8
+        final_error = torch.abs(theta * final_poly - theta_d)
+        deriv = 1.0 + 3.0 * k1 * theta * theta + 5.0 * k2 * theta**4 + 7.0 * k3 * theta**6 + 9.0 * k4 * theta**8
+        tol = 1e-6 + 1e-6 * torch.abs(theta_d)
+        sat_mask = (theta >= (math.pi / 2.0 - 1e-6)) | (final_error > tol) | (deriv <= 0.0) | ~torch.isfinite(theta) | ~torch.isfinite(rd)
         ru = torch.tan(theta)
         scale = torch.where(rd > 0, ru / rd, torch.zeros_like(rd))
         xu = xd * scale
@@ -293,6 +316,16 @@ def undistort_points_fisheye(points, K, D):
         if center_mask.any():
             out[center_mask, 0, 0] = cx
             out[center_mask, 0, 1] = cy
+        # For saturated/invalid solutions, mimic OpenCV by returning large negative sentinel
+        if sat_mask.any():
+            out[sat_mask, 0, 0] = -1e6
+            out[sat_mask, 0, 1] = -1e6
+        # Also check if resulting points are unreasonably far from image bounds
+        img_size_est = max(float(fx), float(fy)) * 10.0
+        invalid_mask = (torch.abs(out[:, 0, 0] - cx) > img_size_est) | (torch.abs(out[:, 0, 1] - cy) > img_size_est)
+        if invalid_mask.any():
+            out[invalid_mask, 0, 0] = -1e6
+            out[invalid_mask, 0, 1] = -1e6
         return out
     else:
         pts = np.asarray(points)
@@ -308,14 +341,18 @@ def undistort_points_fisheye(points, K, D):
         k2 = d[1] if d.size > 1 else 0.0
         k3 = d[2] if d.size > 2 else 0.0
         k4 = d[3] if d.size > 3 else 0.0
-        theta_d = np.arctan(rd)
-        # Use float64 internally for numerical stability during iterations
-        theta = theta_d.astype(np.float64, copy=True)
+        # OpenCV uses rd directly as theta_d, not atan(rd)
+        theta_d = rd.astype(np.float64)
+        theta = theta_d.copy()
         k1_ = np.float64(k1)
         k2_ = np.float64(k2)
         k3_ = np.float64(k3)
         k4_ = np.float64(k4)
-        for _ in range(8):
+        # Track convergence to detect failures
+        prev_theta = theta.copy()
+        prev_error = np.abs(theta * (1.0 + k1_ * theta * theta) - theta_d)
+        # Use more iterations for better convergence (OpenCV typically uses ~10-20)
+        for iter_idx in range(20):
             # Guard against overflow in intermediate powers and products
             with np.errstate(over="ignore", invalid="ignore"): 
                 t2 = theta * theta
@@ -325,15 +362,32 @@ def undistort_points_fisheye(points, K, D):
                 poly = 1.0 + k1_ * t2 + k2_ * t4 + k3_ * t6 + k4_ * t8
                 f = theta * poly - theta_d
                 dtheta = 1.0 + 3.0 * k1_ * t2 + 5.0 * k2_ * t4 + 7.0 * k3_ * t6 + 9.0 * k4_ * t8
-                denom = np.where(dtheta != 0.0, dtheta, 1.0)
+                denom = np.where(np.abs(dtheta) > 1e-10, dtheta, 1.0)
                 step = f / denom
             # Limit step size to avoid divergence; keep theta away from pi/2 where tan explodes
             step = np.clip(step, -0.5, 0.5)
-            theta = theta - step
-            theta = np.clip(theta, 0.0, (np.pi / 2.0) - 1e-6)
-        # Back to original dtype for subsequent computations
-        theta = theta.astype(np.float64)
+            theta_new = theta - step
+            theta_new = np.clip(theta_new, 0.0, (np.pi / 2.0) - 1e-6)
+            # Check for convergence or oscillation
+            error = np.abs(f)
+            theta_change = np.abs(theta_new - theta)
+            prev_theta = theta
+            theta = theta_new
+            # Early convergence check (all points converged)
+            if np.all(error < 1e-10) and np.all(theta_change < 1e-10):
+                break
+        # Final clipping
         theta = np.clip(theta, 0.0, (np.pi / 2.0) - 1e-6)
+        # Check for invalid solutions:
+        # 1. Theta too close to pi/2 (saturation)
+        # 2. Final error too large (convergence failure)
+        # 3. Non-positive derivative (non-invertible region)
+        # 4. Theta/rd is NaN or inf
+        final_poly = 1.0 + k1_ * theta * theta + k2_ * theta**4 + k3_ * theta**6 + k4_ * theta**8
+        final_error = np.abs(theta * final_poly - theta_d)
+        deriv = 1.0 + 3.0 * k1_ * theta * theta + 5.0 * k2_ * theta**4 + 7.0 * k3_ * theta**6 + 9.0 * k4_ * theta**8
+        tol = 1e-6 + 1e-6 * np.abs(theta_d)
+        sat_mask = (theta >= ((np.pi / 2.0) - 1e-6)) | (final_error > tol) | (deriv <= 0.0) | ~np.isfinite(theta) | ~np.isfinite(rd)
         ru = np.tan(theta)
         with np.errstate(invalid="ignore", divide="ignore"):
             scale = np.where(rd > 0, ru / rd, 0.0)
@@ -345,13 +399,25 @@ def undistort_points_fisheye(points, K, D):
         if np.any(center_mask):
             out[center_mask, 0, 0] = cx
             out[center_mask, 0, 1] = cy
+        # For saturated/invalid solutions, mimic OpenCV by returning large negative sentinel
+        if np.any(sat_mask):
+            out[sat_mask, 0, 0] = -1e6
+            out[sat_mask, 0, 1] = -1e6
+        # Also check if resulting points are unreasonably far from image bounds (additional OpenCV check)
+        # Points more than 10x image size away are likely invalid
+        img_size_est = max(fx, fy) * 10.0  # Rough estimate of reasonable bounds
+        invalid_mask = (np.abs(out[:, 0, 0] - cx) > img_size_est) | (np.abs(out[:, 0, 1] - cy) > img_size_est)
+        if np.any(invalid_mask):
+            out[invalid_mask, 0, 0] = -1e6
+            out[invalid_mask, 0, 1] = -1e6
         return out
 
 
 def warp_image_fisheye(image, K, D):
     Hh, Ww = image.shape[:2]
     grid_x, grid_y = np.meshgrid(np.arange(Ww, dtype=np.float32), np.arange(Hh, dtype=np.float32))
-    undist_pts = undistort_points_fisheye(np.stack([grid_x, grid_y], axis=-1).reshape(-1, 1, 2), K, D)
+    grid_pts = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 1, 2)
+    undist_pts = undistort_points_fisheye(grid_pts, K, D)
     # pts = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 1, 2)
     # # Map distorted pixels to undistorted pixels using P=K to get pixel coords directly
     # undist_pts = cv2.fisheye.undistortPoints(pts, K, D, P=K)  # (N,1,2)
@@ -364,8 +430,9 @@ def warp_image_fisheye(image, K, D):
         image, map_x, map_y,
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
     )
-
+    
 def unwarp_image_fisheye(image, K, D):
     Hh, Ww = image.shape[:2]
     grid_x, grid_y = np.meshgrid(np.arange(Ww, dtype=np.float32), np.arange(Hh, dtype=np.float32))
@@ -386,6 +453,7 @@ def unwarp_image_fisheye(image, K, D):
         image, map_x, map_y,
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
     )
 
 def distort_points_fisheye_torch(points, K, D):
@@ -444,7 +512,8 @@ def distort_points_fisheye_torch(points, K, D):
     t6 = t4 * t2
     t8 = t4 * t4
     theta_d = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8)
-    rd = torch.tan(theta_d)
+    # OpenCV uses rd = theta_d directly (not tan(theta_d)), consistent with undistort
+    rd = theta_d
 
     scale = torch.where(ru > 0, rd / ru, torch.zeros_like(ru))
     xd = xu * scale
@@ -508,10 +577,11 @@ def undistort_points_fisheye_torch(points, K, D):
     k3 = get_coeff(2)
     k4 = get_coeff(3)
 
-    # Solve theta * (1 + k1*t^2 + k2*t^4 + k3*t^6 + k4*t^8) = theta_d, where theta_d = atan(rd)
-    theta_d = torch.atan(rd)
+    # OpenCV uses rd directly as theta_d, not atan(rd)
+    # Solve theta * (1 + k1*t^2 + k2*t^4 + k3*t^6 + k4*t^8) = theta_d, where theta_d = rd
+    theta_d = rd.to(torch.float64)
     # Use float64 for numerical stability during iterations
-    theta = theta_d.to(torch.float64)
+    theta = theta_d.clone()
     k1d = k1.to(torch.float64)
     k2d = k2.to(torch.float64)
     k3d = k3.to(torch.float64)

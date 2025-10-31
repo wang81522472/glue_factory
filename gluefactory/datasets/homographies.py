@@ -347,28 +347,6 @@ class _Dataset(torch.utils.data.Dataset):
         data0 = self._read_view(img, left_conf, None, ps, left=True)
         data1 = self._read_view(img, self.conf.homography, self.conf.fisheye, ps, left=False)
 
-
-        # img0 = data0["image"].detach().cpu().permute(1, 2, 0).numpy()
-        # img1 = warp_image_fisheye(img0, data1["K"], data1["D"])
-        # img2 = data1["image"].detach().cpu().permute(1, 2, 0).numpy()
-
-        # fig, axs = plt.subplots(1, 3, figsize=(12, 5))
-        # axs[0].imshow(img0)
-        # axs[0].set_title("View0")
-        # axs[0].axis("off")
-        # # scatter(axs[0], kpts0, c='yellow', s=6)
-
-        # axs[1].imshow(img1)
-        # axs[1].set_title("View1")
-        # axs[1].axis("off")
-
-        # axs[2].imshow(img2)
-        # axs[2].set_title("View2")
-        # axs[2].axis("off")
-
-        # plt.tight_layout()
-        # plt.show()
-
         H = compute_homography(data0["coords"], data1["coords"], [1, 1])
 
         data = {
