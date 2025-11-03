@@ -108,10 +108,12 @@ def gt_matches_from_pose_depth(
 
 
 @torch.no_grad()
-def gt_matches_from_homography(kp0, kp1, H, pos_th=3, neg_th=6, fisheye_params = None, **kw):
-
-    if fisheye_params is not None:
-        kp1 = undistort_points_fisheye_torch(kp1, fisheye_params["K"], fisheye_params["D"])
+def gt_matches_from_homography(kp0, kp1, H, pos_th=3, neg_th=6, fisheye_params0 = None, fisheye_params1 = None, **kw):
+    
+    if fisheye_params0 is not None:
+        kp0 = undistort_points_fisheye_torch(kp0, fisheye_params0["K"], fisheye_params0["D"])
+    if fisheye_params1 is not None:
+        kp1 = undistort_points_fisheye_torch(kp1, fisheye_params1["K"], fisheye_params1["D"])
 
     if kp0.shape[1] == 0 or kp1.shape[1] == 0:
         b_size, n_kp0 = kp0.shape[:2]

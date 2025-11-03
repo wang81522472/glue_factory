@@ -307,6 +307,10 @@ class _Dataset(torch.utils.data.Dataset):
     def _read_view(self, img, H_conf, fisheye_params, ps, left=False):
         data = sample_homography(img, H_conf, ps)
         if left:
+            if fisheye_params is not None and fisheye_params.get("apply_fisheye", True):
+                data["fisheye_params"] = {}
+                data["fisheye_params"]["K"], data["fisheye_params"]["D"] = generate_fisheye_K_D(img.shape[:2], fisheye_params)
+                data["image"] = warp_image_fisheye(data["image"], data["fisheye_params"]["K"], data["fisheye_params"]["D"])           
             data["image"] = self.left_augment(data["image"], return_tensor=True)
         else:
             if fisheye_params is not None and fisheye_params.get("apply_fisheye", True):
@@ -344,7 +348,7 @@ class _Dataset(torch.utils.data.Dataset):
         if self.conf.right_only:
             left_conf["difficulty"] = 0.0
 
-        data0 = self._read_view(img, left_conf, None, ps, left=True)
+        data0 = self._read_view(img, left_conf, self.conf.fisheye, ps, left=True)
         data1 = self._read_view(img, self.conf.homography, self.conf.fisheye, ps, left=False)
 
         H = compute_homography(data0["coords"], data1["coords"], [1, 1])
