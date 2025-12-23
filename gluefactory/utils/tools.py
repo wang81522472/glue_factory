@@ -214,6 +214,12 @@ def set_num_threads(nt):
         pass
     else:
         mkl.set_num_threads(nt)
+    try:
+        import cv2
+
+        cv2.setNumThreads(nt)
+    except ImportError:
+        pass
     torch.set_num_threads(1)
     os.environ["IPC_ENABLE"] = "1"
     for o in [
@@ -243,7 +249,7 @@ def get_device():
     
     # Check for CUDA
     if torch.cuda.is_available():
-        return "cuda"
+        return "cuda:1"
     
     # Fall back to CPU
     return "cpu"

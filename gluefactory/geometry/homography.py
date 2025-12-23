@@ -328,89 +328,89 @@ def undistort_points_fisheye(points, K, D):
             out[invalid_mask, 0, 1] = -1e6
         return out
     else:
-        pts = np.asarray(points)
-        assert pts.ndim == 3 and pts.shape[-2:] == (1, 2), "Expected (N,1,2)"
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
-        xd = (pts[:, 0, 0] - cx) / fx
-        yd = (pts[:, 0, 1] - cy) / fy
-        rd = np.sqrt(xd * xd + yd * yd)
-        out = np.empty_like(pts, dtype=pts.dtype)
-        d = np.asarray(D).reshape(-1)
-        k1 = d[0] if d.size > 0 else 0.0
-        k2 = d[1] if d.size > 1 else 0.0
-        k3 = d[2] if d.size > 2 else 0.0
-        k4 = d[3] if d.size > 3 else 0.0
-        # OpenCV uses rd directly as theta_d, not atan(rd)
-        theta_d = rd.astype(np.float64)
-        theta = theta_d.copy()
-        k1_ = np.float64(k1)
-        k2_ = np.float64(k2)
-        k3_ = np.float64(k3)
-        k4_ = np.float64(k4)
-        # Track convergence to detect failures
-        prev_theta = theta.copy()
-        prev_error = np.abs(theta * (1.0 + k1_ * theta * theta) - theta_d)
-        # Use more iterations for better convergence (OpenCV typically uses ~10-20)
-        for iter_idx in range(20):
-            # Guard against overflow in intermediate powers and products
-            with np.errstate(over="ignore", invalid="ignore"): 
-                t2 = theta * theta
-                t4 = t2 * t2
-                t6 = t4 * t2
-                t8 = t4 * t4
-                poly = 1.0 + k1_ * t2 + k2_ * t4 + k3_ * t6 + k4_ * t8
-                f = theta * poly - theta_d
-                dtheta = 1.0 + 3.0 * k1_ * t2 + 5.0 * k2_ * t4 + 7.0 * k3_ * t6 + 9.0 * k4_ * t8
-                denom = np.where(np.abs(dtheta) > 1e-10, dtheta, 1.0)
-                step = f / denom
-            # Limit step size to avoid divergence; keep theta away from pi/2 where tan explodes
-            step = np.clip(step, -0.5, 0.5)
-            theta_new = theta - step
-            theta_new = np.clip(theta_new, 0.0, (np.pi / 2.0) - 1e-6)
-            # Check for convergence or oscillation
-            error = np.abs(f)
-            theta_change = np.abs(theta_new - theta)
-            prev_theta = theta
-            theta = theta_new
-            # Early convergence check (all points converged)
-            if np.all(error < 1e-10) and np.all(theta_change < 1e-10):
-                break
-        # Final clipping
-        theta = np.clip(theta, 0.0, (np.pi / 2.0) - 1e-6)
-        # Check for invalid solutions:
-        # 1. Theta too close to pi/2 (saturation)
-        # 2. Final error too large (convergence failure)
-        # 3. Non-positive derivative (non-invertible region)
-        # 4. Theta/rd is NaN or inf
-        final_poly = 1.0 + k1_ * theta * theta + k2_ * theta**4 + k3_ * theta**6 + k4_ * theta**8
-        final_error = np.abs(theta * final_poly - theta_d)
-        deriv = 1.0 + 3.0 * k1_ * theta * theta + 5.0 * k2_ * theta**4 + 7.0 * k3_ * theta**6 + 9.0 * k4_ * theta**8
-        tol = 1e-6 + 1e-6 * np.abs(theta_d)
-        sat_mask = (theta >= ((np.pi / 2.0) - 1e-6)) | (final_error > tol) | (deriv <= 0.0) | ~np.isfinite(theta) | ~np.isfinite(rd)
-        ru = np.tan(theta)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            scale = np.where(rd > 0, ru / rd, 0.0)
-            xu = xd * scale
-            yu = yd * scale
-        out[:, 0, 0] = fx * xu + cx
-        out[:, 0, 1] = fy * yu + cy
-        center_mask = rd == 0
-        if np.any(center_mask):
-            out[center_mask, 0, 0] = cx
-            out[center_mask, 0, 1] = cy
-        # For saturated/invalid solutions, mimic OpenCV by returning large negative sentinel
-        if np.any(sat_mask):
-            out[sat_mask, 0, 0] = -1e6
-            out[sat_mask, 0, 1] = -1e6
-        # Also check if resulting points are unreasonably far from image bounds (additional OpenCV check)
-        # Points more than 10x image size away are likely invalid
-        img_size_est = max(fx, fy) * 10.0  # Rough estimate of reasonable bounds
-        invalid_mask = (np.abs(out[:, 0, 0] - cx) > img_size_est) | (np.abs(out[:, 0, 1] - cy) > img_size_est)
-        if np.any(invalid_mask):
-            out[invalid_mask, 0, 0] = -1e6
-            out[invalid_mask, 0, 1] = -1e6
-        return out
+        # Use OpenCV implementation for speed
+        return cv2.fisheye.undistortPoints(points, K, D, P=K)
+        # fx, fy = K[0, 0], K[1, 1]
+        # cx, cy = K[0, 2], K[1, 2]
+        # xd = (pts[:, 0, 0] - cx) / fx
+        # yd = (pts[:, 0, 1] - cy) / fy
+        # rd = np.sqrt(xd * xd + yd * yd)
+        # out = np.empty_like(pts, dtype=pts.dtype)
+        # d = np.asarray(D).reshape(-1)
+        # k1 = d[0] if d.size > 0 else 0.0
+        # k2 = d[1] if d.size > 1 else 0.0
+        # k3 = d[2] if d.size > 2 else 0.0
+        # k4 = d[3] if d.size > 3 else 0.0
+        # # OpenCV uses rd directly as theta_d, not atan(rd)
+        # theta_d = rd.astype(np.float64)
+        # theta = theta_d.copy()
+        # k1_ = np.float64(k1)
+        # k2_ = np.float64(k2)
+        # k3_ = np.float64(k3)
+        # k4_ = np.float64(k4)
+        # # Track convergence to detect failures
+        # prev_theta = theta.copy()
+        # prev_error = np.abs(theta * (1.0 + k1_ * theta * theta) - theta_d)
+        # # Use more iterations for better convergence (OpenCV typically uses ~10-20)
+        # for iter_idx in range(20):
+        #     # Guard against overflow in intermediate powers and products
+        #     with np.errstate(over="ignore", invalid="ignore"): 
+        #         t2 = theta * theta
+        #         t4 = t2 * t2
+        #         t6 = t4 * t2
+        #         t8 = t4 * t4
+        #         poly = 1.0 + k1_ * t2 + k2_ * t4 + k3_ * t6 + k4_ * t8
+        #         f = theta * poly - theta_d
+        #         dtheta = 1.0 + 3.0 * k1_ * t2 + 5.0 * k2_ * t4 + 7.0 * k3_ * t6 + 9.0 * k4_ * t8
+        #         denom = np.where(np.abs(dtheta) > 1e-10, dtheta, 1.0)
+        #         step = f / denom
+        #     # Limit step size to avoid divergence; keep theta away from pi/2 where tan explodes
+        #     step = np.clip(step, -0.5, 0.5)
+        #     theta_new = theta - step
+        #     theta_new = np.clip(theta_new, 0.0, (np.pi / 2.0) - 1e-6)
+        #     # Check for convergence or oscillation
+        #     error = np.abs(f)
+        #     theta_change = np.abs(theta_new - theta)
+        #     prev_theta = theta
+        #     theta = theta_new
+        #     # Early convergence check (all points converged)
+        #     if np.all(error < 1e-10) and np.all(theta_change < 1e-10):
+        #         break
+        # # Final clipping
+        # theta = np.clip(theta, 0.0, (np.pi / 2.0) - 1e-6)
+        # # Check for invalid solutions:
+        # # 1. Theta too close to pi/2 (saturation)
+        # # 2. Final error too large (convergence failure)
+        # # 3. Non-positive derivative (non-invertible region)
+        # # 4. Theta/rd is NaN or inf
+        # final_poly = 1.0 + k1_ * theta * theta + k2_ * theta**4 + k3_ * theta**6 + k4_ * theta**8
+        # final_error = np.abs(theta * final_poly - theta_d)
+        # deriv = 1.0 + 3.0 * k1_ * theta * theta + 5.0 * k2_ * theta**4 + 7.0 * k3_ * theta**6 + 9.0 * k4_ * theta**8
+        # tol = 1e-6 + 1e-6 * np.abs(theta_d)
+        # sat_mask = (theta >= ((np.pi / 2.0) - 1e-6)) | (final_error > tol) | (deriv <= 0.0) | ~np.isfinite(theta) | ~np.isfinite(rd)
+        # ru = np.tan(theta)
+        # with np.errstate(invalid="ignore", divide="ignore"):
+        #     scale = np.where(rd > 0, ru / rd, 0.0)
+        #     xu = xd * scale
+        #     yu = yd * scale
+        # out[:, 0, 0] = fx * xu + cx
+        # out[:, 0, 1] = fy * yu + cy
+        # center_mask = rd == 0
+        # if np.any(center_mask):
+        #     out[center_mask, 0, 0] = cx
+        #     out[center_mask, 0, 1] = cy
+        # # For saturated/invalid solutions, mimic OpenCV by returning large negative sentinel
+        # if np.any(sat_mask):
+        #     out[sat_mask, 0, 0] = -1e6
+        #     out[sat_mask, 0, 1] = -1e6
+        # # Also check if resulting points are unreasonably far from image bounds (additional OpenCV check)
+        # # Points more than 10x image size away are likely invalid
+        # img_size_est = max(fx, fy) * 10.0  # Rough estimate of reasonable bounds
+        # invalid_mask = (np.abs(out[:, 0, 0] - cx) > img_size_est) | (np.abs(out[:, 0, 1] - cy) > img_size_est)
+        # if np.any(invalid_mask):
+        #     out[invalid_mask, 0, 0] = -1e6
+        #     out[invalid_mask, 0, 1] = -1e6
+        # return out
 
 
 def warp_image_fisheye(image, K, D):

@@ -274,8 +274,10 @@ def training(rank, conf, output_dir, args):
         train_loader = dataset.get_overfit_loader("train")
         val_loader = val_dataset.get_overfit_loader("val")
     else:
-        train_loader = dataset.get_data_loader("train", distributed=args.distributed)
-        val_loader = val_dataset.get_data_loader("val")
+        train_loader = dataset.get_data_loader(
+            "train", distributed=args.distributed, pinned=torch.cuda.is_available()
+        )
+        val_loader = val_dataset.get_data_loader("val", pinned=torch.cuda.is_available())
     if rank == 0:
         logger.info(f"Training loader has {len(train_loader)} batches")
         logger.info(f"Validation loader has {len(val_loader)} batches")
