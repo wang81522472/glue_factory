@@ -48,34 +48,48 @@ def export_predictions(
                 scales = 1.0 / (
                     data["scales"] if len(idx) == 0 else data[f"view{idx}"]["scales"]
                 )
-                pred[k] = pred[k] * scales[None]
+                # scales: (B, 2)
+                # pred[k]: (B, N, 2)
+                pred[k] = pred[k] * scales[:, None]
             if k.startswith("lines"):
                 idx = k.replace("lines", "")
                 scales = 1.0 / (
                     data["scales"] if len(idx) == 0 else data[f"view{idx}"]["scales"]
                 )
-                pred[k] = pred[k] * scales[None]
+                # scales: (B, 2)
+                # pred[k]: (B, N, 2, 2)
+                pred[k] = pred[k] * scales[:, None, None]
             if k.startswith("orig_lines"):
                 idx = k.replace("orig_lines", "")
                 scales = 1.0 / (
                     data["scales"] if len(idx) == 0 else data[f"view{idx}"]["scales"]
                 )
-                pred[k] = pred[k] * scales[None]
+                pred[k] = pred[k] * scales[:, None, None]
 
-        pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
-
-        if as_half:
-            for k in pred:
-                dt = pred[k].dtype
-                if (dt == np.float32) and (dt != np.float16):
-                    pred[k] = pred[k].astype(np.float16)
-        try:
-            name = data["name"][0]
-            grp = hfile.create_group(name)
-            for k, v in pred.items():
-                grp.create_dataset(k, data=v)
-        except RuntimeError:
-            continue
+        # Iterate over batch elements
+        batch_size = len(data["name"])
+        
+        # Move everything to CPU once (optimization)
+        pred_cpu = {k: v.cpu().numpy() for k, v in pred.items()}
+        
+        for i in range(batch_size):
+            pred_i = {k: v[i] for k, v in pred_cpu.items()}
+            
+            if as_half:
+                for k in pred_i:
+                    dt = pred_i[k].dtype
+                    if (dt == np.float32) and (dt != np.float16):
+                        pred_i[k] = pred_i[k].astype(np.float16)
+            
+            try:
+                name = data["name"][i]
+                if name in hfile:
+                    continue # Skip duplicates
+                grp = hfile.create_group(name)
+                for k, v in pred_i.items():
+                    grp.create_dataset(k, data=v)
+            except RuntimeError:
+                continue
 
         del pred
     hfile.close()
