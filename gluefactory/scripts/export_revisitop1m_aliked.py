@@ -108,7 +108,8 @@ def main():
     model = get_model(conf.model.name)(conf.model).eval().to(device)
 
     # Keys to export
-    keys = ["keypoints", "descriptors", "keypoint_scores"]
+    # keys = ["keypoints", "descriptors", "keypoint_scores"]
+    keys = ["keypoints"]
 
     export_predictions(loader, model, feature_file, as_half=True, keys=keys)
 
