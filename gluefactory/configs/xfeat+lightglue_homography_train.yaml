@@ -1,0 +1,84 @@
+data:
+    name: homographies
+    data_dir: revisitop1m
+    train_size: 1001001
+    val_size: 0
+    batch_size: 32
+    num_workers: 6
+    prefetch_factor: 1
+    homography:
+        difficulty: 0.7
+        max_angle: 45
+    photometric:
+        name: lg
+    cache_aliked_features:
+        do: True  # Pre-compute ALIKED features for original images (eliminates GPU bottleneck!)
+        model_name: aliked-n16rot  # ALIKED model variant to use
+        cache_dir: "exports/revisitop1m/aliked_features"
+    fisheye:
+        apply_fisheye: true
+        random_params: true
+        fx_range: [300.0, 800.0]
+        fy_range: [300.0, 600.0]
+        cx_range: [300.0, 340.0]
+        cy_range: [220.0, 260.0]
+        k1_range: [-0.5, 2.5]
+        k2_range: [-0.1, 0.1]
+        k3_range: [-0.01, 0.01]
+        k4_range: [-0.001, 0.001]
+        fx: 500.0
+        fy: 500.0
+        cx: 320.0
+        cy: 240.0
+        D: [-0.5, 0.0, 0.00, 0.00]
+
+        
+    
+model:
+    name: two_view_pipeline
+    extractor:
+        name: extractors.xfeat
+        max_num_keypoints: 512
+        force_num_keypoints: True
+        detection_threshold: 0.05
+        trainable: True  # Enable XFeat training
+        apply_xfeat_loss: True  # Apply XFeat-specific losses
+        xfeat_loss_weight: 1.0  # Weight for XFeat losses
+        use_aliked_distill: True  # Use ALIKED for keypoint distillation (alternative to ALike)
+        aliked_model_name: aliked-n16  # ALIKED model variant to use
+    ground_truth:
+        name: matchers.homography_matcher
+        th_positive: 3
+        th_negative: 3
+    matcher:
+        name: matchers.lightglue
+        filter_threshold: 0.1
+        flash: false
+        checkpointed: true
+        input_dim: 64
+        descriptor_dim: 64
+        apply_loss: True  # Also train LightGlue
+train:
+    seed: 0
+    epochs: 1
+    log_every_iter: 100
+    eval_every_iter: 500
+    keep_last_checkpoints: 10
+    lr: 1e-4
+    # Use different learning rates for extractor and matcher
+    lr_scaling: [
+        [0.1, ["extractor"]],  # Lower LR for extractor (fine-tuning)
+        [1.0, ["matcher"]],     # Normal LR for matcher
+    ]
+    lr_schedule:
+        start: 20
+        type: exp
+        on_epoch: true
+        exp_div_10: 10
+    plot: [5, 'gluefactory.visualization.visualize_batch.make_match_figures']
+benchmarks:
+    hpatches:
+      eval:
+        estimator: opencv
+        ransac_th: 0.5
+
