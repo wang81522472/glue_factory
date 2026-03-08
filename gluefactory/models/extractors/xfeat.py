@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
+from collections import OrderedDict
 from omegaconf import OmegaConf
 import importlib.util
 
@@ -22,10 +23,14 @@ if __name__ == "__main__":
     sys.path.insert(0, str(project_root))
     from gluefactory.models.base_model import BaseModel
     from gluefactory.models.utils.misc import pad_to_length, pad_and_stack
+    from gluefactory.geometry.homography import warp_points_torch, distort_points_fisheye
+    from gluefactory.settings import DATA_PATH
 else:
     # 当作为模块导入时使用相对导入
     from ..base_model import BaseModel
     from ..utils.misc import pad_to_length, pad_and_stack
+    from ...geometry.homography import warp_points_torch, distort_points_fisheye
+    from ...settings import DATA_PATH
 
 # 使用相对路径查找accelerated_features
 def find_accelerated_features():
@@ -103,7 +108,12 @@ class XFeat(BaseModel):
         "trainable": False,  # Enable training
         "apply_xfeat_loss": True,  # Apply XFeat-specific losses
         "xfeat_loss_weight": 1.0,  # Weight for XFeat losses
-        "use_aliked_distill": True,  # Use ALIKED for distillation (requires pre-computed ALIKED features in dataset cache)
+        # Optional: path to an H5 file containing precomputed ALIKED keypoints per image name.
+        # If provided, XFeat training will load keypoints on-the-fly when the dataset does not
+        # provide them in `view{0,1}.cache.aliked_keypoints`.
+        "aliked_keypoint_dir": None,
+        "aliked_keypoint_keys": ("aliked_keypoints", "keypoints", "kpts", "points"),
+        "aliked_cache_size": 2048,  # number of images to keep in memory (keypoints only)
     }
 
     required_data_keys = ["image"]
@@ -111,200 +121,106 @@ class XFeat(BaseModel):
     def _init(self, conf):
         # Ensure accelerated_features is available
         _ensure_accelerated_features()
-        
-        # Import training utilities (only if trainable)
-        if conf.trainable:
-            try:
-                if accelerated_features_path not in sys.path:
-                    sys.path.append(accelerated_features_path)
-                
-                # Import loss functions and utilities
-                # Note: The losses module imports ALike at the top level, which may fail
-                # We'll handle this by importing the module and extracting functions manually
-                try:
-                    # Try importing utils first (doesn't depend on ALike)
-                    try:
-                        from accelerated_features.modules.training.utils import check_accuracy
-                    except (ImportError, ModuleNotFoundError):
-                        from modules.training.utils import check_accuracy
-                    
-                    # Import the losses module, handling ALike import failure
-                    # We'll import the module and extract the functions we need
-                    losses_module = None
-                    try:
-                        try:
-                            import accelerated_features.modules.training.losses as losses_module
-                        except (ImportError, ModuleNotFoundError):
-                            import modules.training.losses as losses_module
-                    except (ImportError, ModuleNotFoundError) as e:
-                        error_msg = str(e).lower()
-                        if 'alike' in error_msg or 'extract_alike_kpts' in error_msg:
-                            # ALike import failed, but we can still use the other loss functions
-                            # by importing them directly from the source
-                            print(f"Warning: ALike import failed, but core loss functions are still available.")
-                            print("Attempting to import core loss functions directly...")
-                            
-                            # Import core loss functions that don't depend on ALike
-                            import importlib.util
-                            import os
-                            
-                            # Find the losses.py file
-                            losses_path = None
-                            # Try both possible paths
-                            potential_paths = [
-                                os.path.join(accelerated_features_path, 'modules', 'training', 'losses.py'),
-                                os.path.join(accelerated_features_path, 'accelerated_features', 'modules', 'training', 'losses.py'),
-                            ]
-                            for potential_path in potential_paths:
-                                if os.path.exists(potential_path):
-                                    losses_path = potential_path
-                                    break
-                            
-                            if losses_path and os.path.exists(losses_path):
-                                # Read and execute the module, but skip the ALike import
-                                with open(losses_path, 'r') as f:
-                                    losses_code = f.read()
-                                
-                                # Replace the problematic import with a try-except or skip entirely if not trainable
-                                if conf.trainable:
-                                    # Only try to import ALike if trainable
-                                    losses_code = losses_code.replace(
-                                        'from third_party.alike_wrapper import extract_alike_kpts',
-                                        '''try:
-    from third_party.alike_wrapper import extract_alike_kpts
-    ALIKE_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
-    extract_alike_kpts = None
-    ALIKE_AVAILABLE = False'''
-                                    )
-                                else:
-                                    # Skip ALike import entirely when trainable is False
-                                    losses_code = losses_code.replace(
-                                        'from third_party.alike_wrapper import extract_alike_kpts',
-                                        '''# ALike import skipped: trainable is False
-extract_alike_kpts = None
-ALIKE_AVAILABLE = False'''
-                                    )
-                                
-                                # Execute the modified code
-                                losses_namespace = {}
-                                exec(compile(losses_code, losses_path, 'exec'), losses_namespace)
-                                losses_module = type(sys)('losses_module')
-                                losses_module.__dict__.update(losses_namespace)
-                            else:
-                                raise ImportError(f"Could not find losses.py at expected paths")
-                        else:
-                            raise
-                    
-                    # Extract the functions we need
-                    dual_softmax_loss = losses_module.dual_softmax_loss
-                    coordinate_classification_loss = losses_module.coordinate_classification_loss
-                    keypoint_loss = losses_module.keypoint_loss
-                    
-                    # Try to get alike_distill_loss if available and trainable
-                    if conf.trainable:
-                        self.alike_distill_loss = getattr(losses_module, 'alike_distill_loss', None)
-                        self.use_alike_loss = getattr(losses_module, 'ALIKE_AVAILABLE', False)
-                        
-                        if self.alike_distill_loss is None or not self.use_alike_loss:
-                            print("Note: ALike distillation loss is not available. Using ALIKED for distillation if enabled.")
-                            self.alike_distill_loss = None
-                            self.use_alike_loss = False
-                    else:
-                        # Skip ALike initialization when trainable is False
-                        print("Skipping ALike initialization: trainable is False")
-                        self.alike_distill_loss = None
-                        self.use_alike_loss = False
-                    
-                    # Store loss functions
-                    self.dual_softmax_loss = dual_softmax_loss
-                    self.coordinate_classification_loss = coordinate_classification_loss
-                    self.keypoint_loss = keypoint_loss
-                    self.check_accuracy = check_accuracy
-                    
-                except Exception as e:
-                    # If import still fails, try a simpler approach: define the functions locally
-                    print(f"Warning: Could not import loss functions from module: {e}")
-                    print("Attempting to define core loss functions locally...")
-                    
-                    # Define the core loss functions locally (they don't depend on ALike)
-                    def dual_softmax_loss(X, Y, temp=0.2):
-                        if X.size() != Y.size() or X.dim() != 2 or Y.dim() != 2:
-                            raise RuntimeError('Error: X and Y shapes must match and be 2D matrices')
-                        dist_mat = (X @ Y.t()) * temp
-                        conf_matrix12 = F.log_softmax(dist_mat, dim=1)
-                        conf_matrix21 = F.log_softmax(dist_mat.t(), dim=1)
-                        with torch.no_grad():
-                            conf12 = torch.exp(conf_matrix12).max(dim=-1)[0]
-                            conf21 = torch.exp(conf_matrix21).max(dim=-1)[0]
-                            conf = conf12 * conf21
-                        target = torch.arange(len(X), device=X.device)
-                        loss = F.nll_loss(conf_matrix12, target) + F.nll_loss(conf_matrix21, target)
-                        return loss, conf
-                    
-                    def coordinate_classification_loss(coords1, pts1, pts2, conf):
-                        with torch.no_grad():
-                            coords1_detached = pts1 * 8
-                            offsets1_detached = (coords1_detached/8) - (coords1_detached/8).long()
-                            offsets1_detached = (offsets1_detached * 8).long()
-                            labels1 = offsets1_detached[:, 0] + 8*offsets1_detached[:, 1]
-                        coords1_log = F.log_softmax(coords1, dim=-1)
-                        predicted = coords1.max(dim=-1)[1]
-                        acc = (labels1 == predicted)
-                        acc = acc[conf > 0.1]
-                        acc = acc.sum() / len(acc) if len(acc) > 0 else torch.tensor(0.0, device=coords1.device)
-                        loss = F.nll_loss(coords1_log, labels1, reduction='none')
-                        conf = conf / conf.sum()
-                        loss = (loss * conf).sum()
-                        return loss * 2., acc
-                    
-                    def keypoint_loss(heatmap, target):
-                        L1_loss = F.l1_loss(heatmap, target)
-                        return L1_loss * 3.0
-                    
-                    # Import check_accuracy
-                    try:
-                        try:
-                            from accelerated_features.modules.training.utils import check_accuracy
-                        except (ImportError, ModuleNotFoundError):
-                            from modules.training.utils import check_accuracy
-                    except Exception:
-                        # Define check_accuracy locally if import fails
-                        def check_accuracy(X, Y, pts1=None, pts2=None, plot=False):
-                            with torch.no_grad():
-                                dist_mat = X @ Y.t()
-                                nn = torch.argmax(dist_mat, dim=1)
-                                correct = nn == torch.arange(len(X), device=X.device)
-                                acc = correct.sum().item() / len(X)
-                                return acc
-                    
-                    self.dual_softmax_loss = dual_softmax_loss
-                    self.coordinate_classification_loss = coordinate_classification_loss
-                    self.keypoint_loss = keypoint_loss
-                    self.check_accuracy = check_accuracy
-                    self.alike_distill_loss = None
-                    self.use_alike_loss = False
-                    print("Successfully loaded core loss functions (ALike distillation disabled).")
-                    
-            except Exception as e:
-                # If training modules are not available, disable training
-                print(f"Warning: Could not import XFeat training modules: {e}")
-                print("XFeat training will be disabled.")
-                self.dual_softmax_loss = None
-                self.coordinate_classification_loss = None
-                self.keypoint_loss = None
-                self.alike_distill_loss = None
-                self.use_alike_loss = False
-                self.check_accuracy = None
+
+        # Flag indicating whether we actually train XFeat
+        is_trainable = bool(conf.trainable)
+
+        # Path to optional ALIKED keypoints H5 file (used only for distillation)
+        aliked_h5_path = None
+
+        if is_trainable:
+            aliked_path = conf.get("aliked_keypoint_dir", None)
+            if aliked_path is not None:
+                p = Path(str(aliked_path))
+                if not p.is_absolute():
+                    # Prefer DATA_PATH-relative paths (consistent with other gluefactory exports).
+                    cand = Path(DATA_PATH) / p
+                    p = cand if cand.exists() else p
+
+                if not p.exists():
+                    print(f"WARNING: aliked_keypoint_dir '{aliked_path}' does not exist.")
+                    print("WARNING: Disabling XFeat training.")
+                    is_trainable = False
+                else:
+                    aliked_h5_path = str(p)
+
+        # Define local loss functions and utilities.
+        # These are adapted from the original accelerated_features implementation
+        # but live entirely in this file to avoid importing training modules.
+        if is_trainable:
+            def dual_softmax_loss(X, Y, temp=0.2):
+                if X.size() != Y.size() or X.dim() != 2 or Y.dim() != 2:
+                    raise RuntimeError(
+                        "Error: X and Y shapes must match and be 2D matrices"
+                    )
+                dist_mat = (X @ Y.t()) * temp
+                conf_matrix12 = F.log_softmax(dist_mat, dim=1)
+                conf_matrix21 = F.log_softmax(dist_mat.t(), dim=1)
+                with torch.no_grad():
+                    conf12 = torch.exp(conf_matrix12).max(dim=-1)[0]
+                    conf21 = torch.exp(conf_matrix21).max(dim=-1)[0]
+                    conf = conf12 * conf21
+                target = torch.arange(len(X), device=X.device)
+                loss = F.nll_loss(conf_matrix12, target) + F.nll_loss(
+                    conf_matrix21, target
+                )
+                return loss, conf
+
+            def coordinate_classification_loss(coords1, pts1, pts2, conf):
+                # pts1/pts2 are in coarse (1/8) coordinates
+                with torch.no_grad():
+                    coords1_detached = pts1 * 8
+                    offsets1_detached = (coords1_detached / 8) - (
+                        coords1_detached / 8
+                    ).long()
+                    offsets1_detached = (offsets1_detached * 8).long()
+                    labels1 = offsets1_detached[:, 0] + 8 * offsets1_detached[:, 1]
+                coords1_log = F.log_softmax(coords1, dim=-1)
+                predicted = coords1.max(dim=-1)[1]
+                acc = (labels1 == predicted)
+                acc = acc[conf > 0.1]
+                acc = (
+                    acc.sum() / len(acc)
+                    if len(acc) > 0
+                    else torch.tensor(0.0, device=coords1.device)
+                )
+                loss = F.nll_loss(coords1_log, labels1, reduction="none")
+                conf = conf / conf.sum()
+                loss = (loss * conf).sum()
+                return loss * 2.0, acc
+
+            def keypoint_loss(heatmap, target):
+                L1_loss = F.l1_loss(heatmap, target)
+                return L1_loss * 3.0
+
+            def check_accuracy(X, Y, pts1=None, pts2=None, plot=False):
+                # Simple nearest-neighbour accuracy in descriptor space.
+                del pts1, pts2, plot  # unused but kept for API compatibility
+                with torch.no_grad():
+                    dist_mat = X @ Y.t()
+                    nn = torch.argmax(dist_mat, dim=1)
+                    correct = nn == torch.arange(len(X), device=X.device)
+                    acc = correct.float().mean()
+                    return acc
+
+            self.dual_softmax_loss = dual_softmax_loss
+            self.coordinate_classification_loss = coordinate_classification_loss
+            self.keypoint_loss = keypoint_loss
+            self.check_accuracy = check_accuracy
+            # ALike distillation via external modules is disabled;
+            # we only use pre-loaded ALIKED keypoints.
+            self.alike_distill_loss = None
+            self.use_alike_loss = False
         else:
-            # Skip all training-related imports when trainable is False
-            print("Skipping training utilities import: trainable is False")
+            # Skip all training-related utilities when trainable is False
+            print("Skipping training utilities setup: trainable is False")
             self.dual_softmax_loss = None
             self.coordinate_classification_loss = None
             self.keypoint_loss = None
             self.alike_distill_loss = None
             self.use_alike_loss = False
             self.check_accuracy = None
+
         
         # Initialize XFeat model
         default_weights_path = str(Path(accelerated_features_path) / 'weights' / 'xfeat.pt')
@@ -326,17 +242,110 @@ ALIKE_AVAILABLE = False'''
         self.net = self.xfeat.net
         
         # Set trainable parameters
-        if not conf.trainable:
+        if not is_trainable:
             for p in self.net.parameters():
                 p.requires_grad = False
         
         # ALIKED distillation uses pre-computed features from dataset cache
         # No need to initialize ALIKED model here - features are loaded from disk
-        self.use_aliked_distill = conf.get("use_aliked_distill", True)
+        self.use_aliked_distill = is_trainable
+        # This is used only during training and only if cached keypoints are not provided by the dataset.
+        self._aliked_h5 = None
+        self._aliked_kpts_cache = OrderedDict()
+        self._aliked_kpts_cache_size = int(conf.get("aliked_cache_size", 2048))
+        self._aliked_keypoint_keys = tuple(conf.get("aliked_keypoint_keys", ("aliked_keypoints", "keypoints", "kpts", "points")))
+        self._aliked_h5_path = aliked_h5_path
         
         # Move to GPU by default for better performance
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.xfeat.to(self.device)
+
+    def _get_aliked_h5(self):
+        """Lazily open the ALIKED keypoints H5 file (read-only)."""
+        if self._aliked_h5 is not None:
+            return self._aliked_h5
+        if self._aliked_h5_path is None:
+            return None
+        try:
+            import h5py  # local import to avoid hard dependency at inference time
+        except Exception as e:
+            raise ImportError(f"h5py is required to read ALIKED keypoints: {e}")
+        if not Path(self._aliked_h5_path).exists():
+            # Keep it disabled if the file is missing.
+            return None
+        self._aliked_h5 = h5py.File(self._aliked_h5_path, "r")
+        return self._aliked_h5
+
+    def _load_aliked_keypoints_for_name(self, name: str):
+        """Load ALIKED keypoints (N,2) for a given sample name from H5."""
+        if name in self._aliked_kpts_cache:
+            k = self._aliked_kpts_cache.pop(name)
+            self._aliked_kpts_cache[name] = k
+            return k
+
+        h5 = self._get_aliked_h5()
+        if h5 is None:
+            return None
+
+        if name not in h5:
+            return None
+        grp = h5[name]
+
+        ds = None
+        if hasattr(grp, "keys"):
+            for k in self._aliked_keypoint_keys:
+                if k in grp:
+                    ds = grp[k]
+                    break
+        if ds is None:
+            return None
+
+        arr = np.asarray(ds[...], dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[-1] != 2:
+            return None
+
+        # LRU cache
+        self._aliked_kpts_cache[name] = arr
+        if len(self._aliked_kpts_cache) > self._aliked_kpts_cache_size:
+            self._aliked_kpts_cache.popitem(last=False)
+        return arr
+
+    def _transform_aliked_keypoints_to_view(self, kpts_xy: torch.Tensor, view: dict, b: int, inverse: bool = False) -> torch.Tensor:
+        """
+        Transform ALIKED keypoints from original image coordinates to a view's image coordinates.
+        Applies homography (and optional fisheye distortion) and filters to valid image bounds.
+        """
+        if kpts_xy.numel() == 0:
+            return kpts_xy
+
+        # Homography warp: original -> view
+        if "H_" in view:
+            H = view["H_"][b : b + 1]  # (1,3,3)
+            kpts_xy = warp_points_torch(kpts_xy[None], H, inverse=inverse)[0]
+
+        # Optional fisheye distortion (if present in the view dict)
+        if "fisheye_params" in view and view["fisheye_params"] is not None:
+            try:
+                K = view["fisheye_params"]["K"][b] if isinstance(view["fisheye_params"]["K"], torch.Tensor) and view["fisheye_params"]["K"].dim() == 3 else view["fisheye_params"]["K"]
+                D = view["fisheye_params"]["D"][b] if isinstance(view["fisheye_params"]["D"], torch.Tensor) and view["fisheye_params"]["D"].dim() == 2 else view["fisheye_params"]["D"]
+                pts = distort_points_fisheye(kpts_xy[:, None, :], K, D)  # (N,1,2)
+                kpts_xy = pts[:, 0, :]
+            except Exception:
+                # If fisheye params are malformed, skip distortion.
+                pass
+
+        # Filter to image bounds
+        img = view.get("image", None)
+        if isinstance(img, torch.Tensor):
+            H_img, W_img = int(img.shape[-2]), int(img.shape[-1])
+            valid = (
+                (kpts_xy[:, 0] >= 0.0)
+                & (kpts_xy[:, 0] <= float(W_img - 1))
+                & (kpts_xy[:, 1] >= 0.0)
+                & (kpts_xy[:, 1] <= float(H_img - 1))
+            )
+            kpts_xy = kpts_xy[valid]
+        return kpts_xy
 
     def _forward(self, data):
         image = data["image"]
@@ -621,6 +630,58 @@ ALIKE_AVAILABLE = False'''
                         aliked_losses_p2.append(torch.tensor(0.0, device=p2.device))
                         aliked_accs_p1.append(torch.tensor(0.0, device=p1.device))
                         aliked_accs_p2.append(torch.tensor(0.0, device=p2.device))
+
+        # Fallback: load ALIKED keypoints from an H5 file specified in the extractor conf.
+        # This avoids requiring the dataset to pre-cache variable-length keypoints.
+        if (
+            self.use_aliked_distill
+            and not use_cached_aliked
+            and self._aliked_h5_path is not None
+            and aliked_losses_p1 is None
+            and ("name" in data)
+        ):
+            try:
+                aliked_losses_p1 = []
+                aliked_losses_p2 = []
+                aliked_accs_p1 = []
+                aliked_accs_p2 = []
+
+                names = data["name"]
+                view0 = data.get("view0", {})
+                view1 = data.get("view1", {})
+                for b in range(B):
+                    name_b = names[b]
+                    kpts_np = self._load_aliked_keypoints_for_name(name_b)
+                    if kpts_np is None or len(kpts_np) == 0:
+                        aliked_losses_p1.append(torch.tensor(0.0, device=p1.device))
+                        aliked_losses_p2.append(torch.tensor(0.0, device=p2.device))
+                        aliked_accs_p1.append(torch.tensor(0.0, device=p1.device))
+                        aliked_accs_p2.append(torch.tensor(0.0, device=p2.device))
+                        continue
+
+                    kpts_orig = torch.from_numpy(kpts_np).to(device=p1.device, dtype=torch.float32)  # (N,2)
+                    kpts_view0 = self._transform_aliked_keypoints_to_view(kpts_orig, view0, b, inverse=False)
+                    kpts_view1 = self._transform_aliked_keypoints_to_view(kpts_orig.to(p2.device), view1, b, inverse=False)
+
+                    kpts1_single = kpts1[b : b + 1]  # (1,C,H,W) logits for view0
+                    kpts2_single = kpts2[b : b + 1]  # (1,C,H,W) logits for view1
+
+                    losses_p1, accs_p1 = self._aliked_distill_loss_from_keypoints(
+                        kpts1_single, kpts_view0[None], p1.shape[-2:], p1.device
+                    )
+                    losses_p2, accs_p2 = self._aliked_distill_loss_from_keypoints(
+                        kpts2_single, kpts_view1[None], p2.shape[-2:], p2.device
+                    )
+                    aliked_losses_p1.append(losses_p1[0])
+                    aliked_losses_p2.append(losses_p2[0])
+                    aliked_accs_p1.append(accs_p1[0])
+                    aliked_accs_p2.append(accs_p2[0])
+            except Exception:
+                # If anything goes wrong reading/transforming, just disable the fallback for this batch.
+                aliked_losses_p1 = None
+                aliked_losses_p2 = None
+                aliked_accs_p1 = None
+                aliked_accs_p2 = None
         
         # Note: ALIKED features must be pre-computed and cached in dataset
         # If cached features are not available, distillation loss will be zero
@@ -680,21 +741,16 @@ ALIKE_AVAILABLE = False'''
                 coords1, pts1_coarse, pts2_coarse, conf
             )
             
-            # Keypoint position distillation loss (ALIKED from cache or ALike fallback)
-            if self.use_aliked_distill and aliked_losses_p1 is not None:
+            # Keypoint position distillation loss (ALIKED from precomputed keypoints only)
+            if aliked_losses_p1 is not None:
                 # Use pre-computed ALIKED losses from cached features
                 loss_kp_pos1 = aliked_losses_p1[b]
                 loss_kp_pos2 = aliked_losses_p2[b]
                 acc_pos1 = aliked_accs_p1[b]
                 acc_pos2 = aliked_accs_p2[b]
                 loss_kp_pos = (loss_kp_pos1 + loss_kp_pos2) * 2.0
-            elif self.use_alike_loss and self.alike_distill_loss is not None:
-                # Fall back to ALike if available (still sequential, but less common)
-                loss_kp_pos1, acc_pos1 = self.alike_distill_loss(kpts1[b], p1[b])
-                loss_kp_pos2, acc_pos2 = self.alike_distill_loss(kpts2[b], p2[b])
-                loss_kp_pos = (loss_kp_pos1 + loss_kp_pos2) * 2.0
             else:
-                # Skip distillation loss if neither is available
+                # Skip distillation loss if precomputed ALIKED keypoints are not available
                 loss_kp_pos = torch.tensor(0.0, device=p1.device)
                 acc_pos1 = torch.tensor(0.0, device=p1.device)
                 acc_pos2 = torch.tensor(0.0, device=p1.device)
@@ -727,8 +783,7 @@ ALIKE_AVAILABLE = False'''
                 
                 metrics["xfeat/acc_coarse"] = to_1d_tensor(acc_coarse)
                 metrics["xfeat/acc_fine"] = to_1d_tensor(acc_coords)
-                if (self.use_aliked_distill and aliked_losses_p1 is not None) or \
-                   (self.use_alike_loss and self.alike_distill_loss is not None):
+                if aliked_losses_p1 is not None:
                     acc_kp_pos_val = (acc_pos1 + acc_pos2) / 2.0
                     metrics["xfeat/acc_kp_pos"] = to_1d_tensor(acc_kp_pos_val)
         

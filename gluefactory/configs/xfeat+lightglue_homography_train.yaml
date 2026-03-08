@@ -1,8 +1,8 @@
 data:
     name: homographies
     data_dir: revisitop1m
-    train_size: 1001001
-    val_size: 0
+    train_size: 150000
+    val_size: 2000
     batch_size: 32
     num_workers: 6
     prefetch_factor: 1
@@ -11,10 +11,6 @@ data:
         max_angle: 45
     photometric:
         name: lg
-    cache_aliked_features:
-        do: True  # Pre-compute ALIKED features for original images (eliminates GPU bottleneck!)
-        model_name: aliked-n16rot  # ALIKED model variant to use
-        cache_dir: "exports/revisitop1m/aliked_features"
     fisheye:
         apply_fisheye: true
         random_params: true
@@ -44,8 +40,7 @@ model:
         trainable: True  # Enable XFeat training
         apply_xfeat_loss: True  # Apply XFeat-specific losses
         xfeat_loss_weight: 1.0  # Weight for XFeat losses
-        use_aliked_distill: True  # Use ALIKED for keypoint distillation (alternative to ALike)
-        aliked_model_name: aliked-n16  # ALIKED model variant to use
+        aliked_keypoint_dir: "exports/revisitop1m/aliked_features/alikedrot16_keypoints.h5"
     ground_truth:
         name: matchers.homography_matcher
         th_positive: 3
@@ -60,7 +55,7 @@ model:
         apply_loss: True  # Also train LightGlue
 train:
     seed: 0
-    epochs: 1
+    epochs: 40
     log_every_iter: 100
     eval_every_iter: 500
     keep_last_checkpoints: 10
